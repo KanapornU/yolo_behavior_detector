@@ -1,0 +1,525 @@
+"""
+yolo_behavior_detector.py
+YOLOv8 + Simple Centroid Tracker + Rule-based Behavior Detection
+
+Usage:
+    python yolo_behavior_detector.py --source 0
+    python yolo_behavior_detector.py --source "video_name.mp4"
+"""
+
+import cv2
+import numpy as np
+import time
+import argparse
+import json
+from collections import deque, defaultdict
+from ultralytics import YOLO
+
+# Import strict THROW feature (as a module)
+from yolo_throw import detect_throw_for_targets
+
+# -------- NMS helpers to remove duplicate detections per frame --------
+def _iou_xyxy(a, b):
+    # a,b: (x1,y1,x2,y2)
+    xA = max(a[0], b[0]); yA = max(a[1], b[1])
+    xB = min(a[2], b[2]); yB = min(a[3], b[3])
+    interW = max(0, xB - xA)
+    interH = max(0, yB - yA)
+    inter = interW * interH
+    areaA = max(1, (a[2]-a[0])) * max(1, (a[3]-a[1]))
+    areaB = max(1, (b[2]-b[0])) * max(1, (b[3]-b[1]))
+    return inter / max(1.0, (areaA + areaB - inter))
+
+def _nms_xyxy(boxes, scores, iou_th=0.55):
+    if not boxes:
+        return []
+    idxs = list(range(len(boxes)))
+    # sort by score desc
+    idxs.sort(key=lambda i: scores[i] if i < len(scores) else 0.0, reverse=True)
+    keep = []
+    while idxs:
+        i = idxs.pop(0)
+        keep.append(i)
+        idxs = [j for j in idxs if _iou_xyxy(boxes[i], boxes[j]) < iou_th]
+    return keep
+
+
+# -----------------------
+# Simple centroid tracker
+# -----------------------
+class CentroidTracker:
+    def __init__(self, max_disappeared=30, max_distance=60):
+        self.next_object_id = 0
+        self.objects = dict()          # object_id -> (centroid_x, centroid_y)
+        self.disappeared = dict()      # object_id -> disappeared_count
+        self.max_disappeared = max_disappeared
+        self.max_distance = max_distance
+        self.tracks = defaultdict(lambda: deque(maxlen=64))  # object_id -> deque of (x,y,frame_idx)
+        self.classes = dict()          # object_id -> class_name
+        self.class_history = defaultdict(lambda: deque(maxlen=12))  # for class stabilization
+
+    def register(self, centroid, class_name, frame_idx):
+        oid = self.next_object_id
+        self.next_object_id += 1
+        self.objects[oid] = centroid
+        self.disappeared[oid] = 0
+        self.tracks[oid].append((centroid[0], centroid[1], frame_idx))
+        self.classes[oid] = class_name
+        return oid
+
+
+    def deregister(self, object_id):
+        if object_id in self.objects:
+            del self.objects[object_id]
+        if object_id in self.disappeared:
+            del self.disappeared[object_id]
+        # keep tracks for post analysis if needed
+
+    def update(self, rects, class_names, frame_idx):
+        """
+        rects: list of centroids [(x,y), ...]
+        class_names: parallel list of class names for each detection
+        returns: dict object_id -> centroid
+        """
+        if len(rects) == 0:
+            for oid in list(self.disappeared.keys()):
+                self.disappeared[oid] += 1
+                if self.disappeared[oid] > self.max_disappeared:
+                    self.deregister(oid)
+            return self.objects
+
+        input_centroids = np.array(rects)
+
+        if len(self.objects) == 0:
+            for i, c in enumerate(input_centroids):
+                self.register((int(c[0]), int(c[1])), class_names[i], frame_idx)
+        else:
+            object_ids = list(self.objects.keys())
+            object_centroids = np.array([self.objects[oid] for oid in object_ids])
+
+            # compute distance matrix
+            D = np.linalg.norm(object_centroids[:, None] - input_centroids[None, :], axis=2)
+            rows = D.min(axis=1).argsort()
+            cols = D.argmin(axis=1)[rows]
+
+            used_rows = set()
+            used_cols = set()
+
+            for r, c in zip(rows, cols):
+                if r in used_rows or c in used_cols:
+                    continue
+                if D[r, c] > self.max_distance:
+                    continue
+                oid = object_ids[r]
+                new_cent = (int(input_centroids[c][0]), int(input_centroids[c][1]))
+                self.objects[oid] = new_cent
+                self.disappeared[oid] = 0
+                self.tracks[oid].append((new_cent[0], new_cent[1], frame_idx))
+                # update class label with stabilization (majority voting over recent history + lock)
+            new_name = class_names[c]
+            hist = self.class_history[oid]
+            hist.append(new_name)
+
+            # majority vote
+            counts = {}
+            for nm in hist:
+                counts[nm] = counts.get(nm, 0) + 1
+            majority_name, votes = max(counts.items(), key=lambda kv: kv[1])
+            total = len(hist)
+            ratio = votes / max(1, total)
+
+            # lock policy
+            min_frames_to_lock = 5
+            lock_ratio = 0.75
+            current = self.classes.get(oid)
+
+            if current is None:
+                # ตั้งชื่อครั้งแรกเลย
+                self.classes[oid] = majority_name
+            else:
+                if total >= min_frames_to_lock:
+                    # หลัง lock window → ต้องชนะขาด
+                    if current != majority_name and ratio >= lock_ratio and votes >= 4:
+                        self.classes[oid] = majority_name
+                else:
+                    # ก่อน lock window → ยอมสลับได้ถ้าโหวตแรงพอ
+                    if current != majority_name and ratio >= 0.6 and votes >= 3:
+                        self.classes[oid] = majority_name
+
+            # unmatched existing objects -> disappeared increment
+            unused_rows = set(range(0, D.shape[0])) - used_rows
+            for r in unused_rows:
+                oid = object_ids[r]
+                self.disappeared[oid] += 1
+                if self.disappeared[oid] > self.max_disappeared:
+                    self.deregister(oid)
+
+            # unmatched input centroids -> register new objects
+            unused_cols = set(range(0, D.shape[1])) - used_cols
+            for c in unused_cols:
+                self.register((int(input_centroids[c][0]), int(input_centroids[c][1])), class_names[c], frame_idx)
+                self.class_history[self.next_object_id - 1].append(class_names[c])
+
+        return self.objects
+
+
+# -----------------------
+# Behavior heuristics (coarse baseline)
+# -----------------------
+def analyze_behavior(track, class_name, fps):
+    """
+    track: deque of (x,y,frame_idx) newest at right
+    class_name: str (e.g., 'person', 'ball')
+    Returns set of labels and confidence approx.
+    """
+    labels = set()
+    conf = 0.6
+
+    if len(track) < 2:
+        labels.add("stationary")
+        return labels, 0.5
+
+    # Use last N points (time-window)
+    N = min(len(track), int(fps * 1.0))  # last 1 second of data
+    points = list(track)[-N:]
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    frames = [p[2] for p in points]
+    dt = (frames[-1] - frames[0]) / max(1, fps)
+    if dt <= 0:
+        dt = 1 / max(1, fps)
+
+    # velocities (px per sec) — coarse estimates
+    vx = (xs[-1] - xs[0]) / dt
+    vy = (ys[-1] - ys[0]) / dt
+    speed = np.sqrt(vx**2 + vy**2)
+
+    # thresholds (pixels/sec) -- may need tuning per resolution
+    stationary_threshold = 10   # px/s
+    moving_threshold = 30
+    fast_threshold = 200
+
+    # direction
+    dir_x = "none"
+    dir_y = "none"
+    if abs(xs[-1] - xs[0]) > abs(ys[-1] - ys[0]):
+        dir_x = "right" if xs[-1] > xs[0] else "left"
+    else:
+        dir_y = "down" if ys[-1] > ys[0] else "up"
+
+    # Stationary vs Moving
+    if speed < stationary_threshold:
+        labels.add("stationary")
+        conf = 0.8
+    else:
+        labels.add("moving")
+        conf = min(0.9, 0.5 + (speed / (fast_threshold*2)))
+        if abs(xs[-1] - xs[0]) > moving_threshold:
+            labels.add(dir_x if dir_x != "none" else dir_y)
+
+    # Detect falling: consistent downward vy large positive
+    fall_v_threshold = 150
+    if vy > fall_v_threshold:
+        labels.add("falling")
+        conf = max(conf, 0.85)
+
+    # # Simple "thrown" heuristic (kept for compatibility; actual strict THROW comes from yolo_throw)
+    # if len(track) >= 4:
+    #     seg_vy = []
+    #     for i in range(1, len(points)):
+    #         fdt = (points[i][2] - points[i-1][2]) / max(1, fps)
+    #         if fdt == 0: fdt = 1/max(1, fps)
+    #         seg_vy.append((points[i][1] - points[i-1][1]) / fdt)
+    #     for i in range(1, len(seg_vy)):
+    #         if seg_vy[i-1] < -fall_v_threshold and seg_vy[i] > fall_v_threshold:
+    #             labels.add("thrown")  # coarse tag
+    #             conf = max(conf, 0.9)
+    #             break
+
+    # rolling/sliding/vibrating as before
+    if class_name and ("ball" in class_name or "sports" in class_name or "wheel" in class_name):
+        if abs(xs[-1]-xs[0]) > 30 and abs(ys[-1]-ys[0]) < 20:
+            labels.add("rolling")
+            conf = max(conf, 0.8)
+
+    if "moving" in labels and abs(vy) < 50 and abs(vx) > 30 and abs(ys[-1]-ys[0]) < 50:
+        labels.add("sliding")
+
+    if len(points) >= 6:
+        dxs = np.diff(xs)
+        dys = np.diff(ys)
+        sign_changes_x = np.sum(np.abs(np.sign(dxs[1:]) - np.sign(dxs[:-1])) > 0)
+        sign_changes_y = np.sum(np.abs(np.sign(dys[1:]) - np.sign(dys[:-1])) > 0)
+        if (sign_changes_x + sign_changes_y > max(2, len(points)//3)) and (max(np.abs(dxs)) < 10):
+            labels.add("vibrating/shaking")
+            conf = 0.8
+
+    return labels, float(min(0.99, conf))
+
+
+# -----------------------
+# Helper to compute per-object kinematics for THROW module
+# -----------------------
+def _kinematics_from_track(track, fps, vy_flip_thresh=80.0):
+    """
+    From a deque of (x,y,frame_idx), compute instantaneous speed, vy, spk, and flip_ok.
+    """
+    if len(track) < 2:
+        return 0.0, 0.0, 0.0, False
+
+    pts = list(track)
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    frames = [p[2] for p in pts]
+
+    # speed/vy from the last step
+    fdt = (frames[-1] - frames[-2]) / max(1, fps)
+    if fdt <= 0:
+        fdt = 1 / max(1, fps)
+    vx = (xs[-1] - xs[-2]) / fdt
+    vy = (ys[-1] - ys[-2]) / fdt
+    speed = float(np.sqrt(vx**2 + vy**2))
+
+    # vy spikes and sign flip
+    vy_vals = []
+    for i in range(1, len(pts)):
+        dt_i = (frames[i] - frames[i-1]) / max(1, fps)
+        if dt_i <= 0: dt_i = 1 / max(1, fps)
+        vy_vals.append((ys[i] - ys[i-1]) / dt_i)
+    spk = max(abs(v) for v in vy_vals) if vy_vals else 0.0
+
+    flip_ok = False
+    for k in range(1, len(vy_vals)):
+        if vy_vals[k-1] < -vy_flip_thresh and vy_vals[k] > vy_flip_thresh:
+            flip_ok = True
+            break
+
+    return speed, vy, float(spk), bool(flip_ok)
+
+
+# -----------------------
+# Main pipeline
+# -----------------------
+def main(args):
+    source = args.source
+    model_path = args.model
+    conf_thres = args.conf
+
+    # initialize model
+    model = YOLO(model_path)
+
+    # video capture
+    cap = cv2.VideoCapture(0 if source == "0" else source)
+    if not cap.isOpened():
+        print("Error: cannot open source:", source)
+        return
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps <= 0 or np.isnan(fps):
+        fps = 25.0
+    print(f"[INFO] source opened. fps={fps}")
+
+    tracker = CentroidTracker(max_disappeared=30, max_distance=80)
+    frame_idx = 0
+
+    # For output JSON log
+    log = []
+
+    # State for THROW smoothing (persist across frames)
+    throw_state = {
+        "airborne_count": defaultdict(int),
+        "strict_air_count": defaultdict(int),
+        "contact_cool": defaultdict(int),
+    }
+
+    # ---- Small-only configuration for THROW overlay ----
+    SMALL_ONLY = bool(getattr(args, 'throw_small_only', False))
+    MAX_AREA_RATIO = 0.06  # 6% of frame area; adjust to taste
+    # ----------------------------------------------------
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frame_idx += 1
+        h, w = frame.shape[:2]
+        area_frame = float(h * w)
+
+        # YOLO detect on frame
+        res_list = model(frame, conf=conf_thres, imgsz=640)
+        res = res_list[0]
+
+        # extract bounding boxes, confidences, class ids, names
+        bboxes = []
+        class_names = []
+        scores = []
+        person_boxes = []  # <- collect person bboxes for THROW
+        if hasattr(res, "boxes") and res.boxes is not None and len(res.boxes) > 0:
+            xyxy = res.boxes.xyxy.cpu().numpy() if res.boxes.xyxy is not None else []
+            cls_ids = res.boxes.cls.cpu().numpy() if res.boxes.cls is not None else []
+            confs  = res.boxes.conf.cpu().numpy() if res.boxes.conf is not None else []
+            for i, box in enumerate(xyxy):
+                x1, y1, x2, y2 = map(int, box[:4])
+                cx = int((x1 + x2) / 2)
+                cy = int((y1 + y2) / 2)
+                bboxes.append((x1, y1, x2, y2, cx, cy))
+                scores.append(float(confs[i]) if i < len(confs) else 0.0)
+                # get class name
+                cls_id = int(cls_ids[i]) if i < len(cls_ids) else -1
+                # model.names may be dict or list
+                if isinstance(model.names, dict):
+                    name = model.names.get(cls_id, str(cls_id))
+                else:
+                    name = model.names[cls_id] if 0 <= cls_id < len(model.names) else str(cls_id)
+                class_names.append(str(name))
+                if str(name).lower() == "person":
+                    person_boxes.append((x1, y1, x2, y2))
+
+        # -------- Apply per-frame NMS to de-duplicate overlapping detections --------
+        # Use IoU threshold from CLI if provided
+        nms_iou = getattr(args, 'nms_iou', 0.55)
+        # Prepare arrays for NMS (on xyxy only)
+        xyxy_list = [(b[0], b[1], b[2], b[3]) for b in bboxes]
+        keep_idx = _nms_xyxy(xyxy_list, scores, iou_th=nms_iou)
+        if keep_idx and len(keep_idx) < len(bboxes):
+            bboxes = [bboxes[i] for i in keep_idx]
+            class_names = [class_names[i] for i in keep_idx]
+            cores = [scores[i] for i in keep_idx]
+            # also filter person_boxes in case duplicates exist (optional: leave as is)
+        # ----------------------------- NMS applied -----------------------------
+        # update tracker with centroids and classes
+        centroids = [(b[4], b[5]) for b in bboxes]
+        tracked = tracker.update(centroids, class_names, frame_idx)
+
+        # reverse map: oid -> bbox index (nearest)
+        oid_to_bbox = {}
+        for i, b in enumerate(bboxes):
+            cx, cy = b[4], b[5]
+            min_d, min_oid = float("inf"), None
+            for oid, cent in tracked.items():
+                d = (cent[0]-cx)**2 + (cent[1]-cy)**2
+                if d < min_d:
+                    min_d, min_oid = d, oid
+            if min_oid is not None:
+                oid_to_bbox[min_oid] = i
+
+        # Build `targets` for THROW (per tracked oid), filtered to small objects and non-person
+        targets = []
+        for oid, cent in tracked.items():
+            track = tracker.tracks[oid]  # deque of (x,y,frame_idx)
+            class_name = tracker.classes.get(oid, "")
+
+            # Skip persons for THROW module; we still keep their baseline behaviors
+            if str(class_name).lower() == "person":
+                continue
+
+            # Need bbox to evaluate size; skip if not available
+            if oid not in oid_to_bbox:
+                continue
+
+            bidx = oid_to_bbox[oid]
+            x1, y1, x2, y2, cx, cy = bboxes[bidx]
+
+            # Small-only filter
+            area_box = float(max(1, (x2 - x1))) * float(max(1, (y2 - y1)))
+            area_ratio = area_box / max(1.0, area_frame)
+            if SMALL_ONLY and area_ratio > MAX_AREA_RATIO:
+                continue
+
+            # Kinematics for THROW
+            speed, vy, spk, flip_ok = _kinematics_from_track(track, fps, vy_flip_thresh=80.0)
+
+            targets.append({
+                "tid": int(oid),
+                "bbox": (x1, y1, x2, y2),
+                "cx": float(cx), "cy": float(cy),
+                "speed": float(speed), "vy": float(vy), "spk": float(spk),
+                "flip_ok": bool(flip_ok),
+                "cname": str(class_name),
+                # history could be provided; not required for strict checks
+            })
+
+        # Run strict THROW on current frame (draw=True overlays only for those targets)
+        throw_results = detect_throw_for_targets(
+            frame, targets, person_boxes, fps,
+            state=throw_state, draw=True,
+            params={
+                "throw_speed": args.throw_speed,
+                "thrown_speed": args.thrown_speed,
+                "vy_flip_thresh": args.vy_flip_thresh if hasattr(args, "vy_flip_thresh") else 60,
+                "min_airborne_frames": args.min_airborne_frames if hasattr(args, "min_airborne_frames") else 2,
+                "strict_air_frames": args.strict_air_frames if hasattr(args, "strict_air_frames") else 1
+            }
+        )
+        thrown_tids = {r["tid"] for r in throw_results if r.get("behavior") == "THROW"}
+
+        # For each tracked object compute general/coarse behaviors and draw
+        frame_behaviors = []
+        show_labels = not getattr(args, 'hide_track_labels', False)
+        for oid, cent in tracked.items():
+            track = tracker.tracks[oid]
+            class_name = tracker.classes.get(oid, "")
+            labels, confidence = analyze_behavior(track, class_name, fps)
+
+            # Upgrade with strict THROW result (add-only; do not remove other labels)
+            if oid in thrown_tids:
+                labels.add("THROW")
+
+            # drawing baseline bbox + id
+            if oid in oid_to_bbox:
+                bidx = oid_to_bbox[oid]
+                x1, y1, x2, y2, cx, cy = bboxes[bidx]
+                label_text = f"ID{oid}:{class_name} {','.join(sorted(list(labels)))}"
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0,200,0), 2)
+                cv2.putText(frame, label_text, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,200,0), 2)
+                cv2.circle(frame, (cx, cy), 3, (0,0,255), -1)
+            # Log
+            frame_behaviors.append({
+                "object_id": oid,
+                "class": class_name,
+                "centroid": [int(cent[0]), int(cent[1])],
+                "behaviors": list(sorted(labels)),
+                "confidence": confidence,
+                "frame": frame_idx,
+            })
+
+        # show frame
+        cv2.imshow("Behavior Detector", frame)
+        # append to log
+        if frame_behaviors:
+            # Compact console log
+            print(json.dumps({"frame": frame_idx, "objects": frame_behaviors}, ensure_ascii=False))
+            # Keep to file buffer
+            log.append({"frame": frame_idx, "objects": frame_behaviors})
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord("q"):
+            break
+
+    # release
+    cap.release()
+    cv2.destroyAllWindows()
+
+    # save log to file
+    fname = f"behavior_log_{int(time.time())}.json"
+    with open(fname, "w", encoding="utf-8") as f:
+        json.dump(log, f, ensure_ascii=False, indent=2)
+    print("[INFO] saved log to", fname)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--source", type=str, default="0", help="video source: 0 for webcam or path to video")
+    parser.add_argument("--model", type=str, default="yolov8n.pt", help="YOLO model path or name")
+    parser.add_argument("--conf", type=float, default=0.35, help="confidence threshold")
+    parser.add_argument("--throw-small-only", action="store_true", help="Enable THROW only for small objects")
+    parser.add_argument("--throw-max-area-ratio", type=float, default=0.15, help="Max area ratio for 'small' objects (0..1)")
+    parser.add_argument("--nms-iou", type=float, default=0.55, help="IoU threshold for per-frame NMS to remove duplicates")
+    parser.add_argument("--throw-speed", type=float, default=140, help="Minimum speed to classify a throw")
+    parser.add_argument("--thrown-speed", type=float, default=140, help="Minimum speed to classify an object as thrown")
+    
+args = parser.parse_args()
+main(args)
+
+# ถ้า sensitive throw, thrown เกิน python yolo_behavior_detector.py --source ex2.mp4 --throw-speed 1000 --thrown-speed 1000
+# แล้วก็ปิดบรรทัด # Simple "thrown" heuristic
